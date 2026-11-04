@@ -61,6 +61,7 @@ class SSLTunnel(SSLConnection):
 
         self.buf = b''
         self.wbuf = b''
+        self.pending = b''   # a framed chunk partially written to the socket
 
     def fileno(self):
         return self.s.fileno()
@@ -72,7 +73,7 @@ class SSLTunnel(SSLConnection):
                 if len(data) == 0:
                     return
                 self._handle_data(data, target_fd)
-            except ssl.SSLWantReadError:
+            except (ssl.SSLWantReadError, ssl.SSLWantWriteError):
                 return
 
     def write_from(self, src_fd):
@@ -109,14 +110,29 @@ class SSLTunnel(SSLConnection):
 
     @property
     def writes_pending(self):
-        return len(self.wbuf) > 0
+        return len(self.wbuf) > 0 or len(self.pending) > 0
 
     def write_pump(self):
-        while len(self.wbuf):
-            packet = self.wbuf[:self.options.max_line]
-            buf = struct.pack('>L', len(packet)) + packet
-            self.s.sendall(buf)
-            self.wbuf = self.wbuf[len(packet):]
+        # Non-blocking TLS: a write can return SSLWantWriteError (socket buffer
+        # full) or SSLWantReadError (renegotiation). Previously this crashed the
+        # tunnel. Instead, send what we can and keep the remainder buffered; the
+        # select loop re-invokes us once the socket is writable again.
+        while self.pending or self.wbuf:
+            if not self.pending:
+                packet = self.wbuf[:self.options.max_line]
+                self.wbuf = self.wbuf[len(packet):]
+                self.pending = struct.pack('>L', len(packet)) + packet
+
+            try:
+                sent = self.s.send(self.pending)
+            except (ssl.SSLWantWriteError, ssl.SSLWantReadError):
+                return  # retry on the next writable/readable cycle
+            except ssl.SSLError:
+                raise
+
+            self.pending = self.pending[sent:]
+            if self.pending:
+                return  # partial write; finish it next cycle
 
     def close(self):
         self.s.close()

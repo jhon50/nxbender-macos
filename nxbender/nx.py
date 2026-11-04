@@ -9,6 +9,8 @@ import sys
 import os
 import re
 import socket
+import threading
+import time
 
 from requests.adapters import HTTPAdapter
 from requests.packages.urllib3.poolmanager import PoolManager
@@ -98,11 +100,30 @@ class NXSession(object):
                 self.options.domain
             )
 
-        logging.info("Starting session...")
-        self.start_session()
+        # (keepalive disabled while diagnosing — suspected of causing drops)
+        # self._start_keepalive()
 
-        logging.info("Dialing up tunnel...")
-        self.tunnel()
+        # Reconnect loop: some SonicWall firmwares (notably the TOTP 5-minute
+        # session bug) tear the tunnel down periodically. If the authenticated
+        # web session is still valid we re-dial the tunnel WITHOUT a new OTP, so
+        # the drop is invisible. If the session itself has expired, start_session
+        # fails and we stop (a fresh OTP login would be required).
+        first = True
+        while True:
+            logging.info("Starting session...")
+            if not self.start_session():
+                if first:
+                    logging.error("Could not start VPN session")
+                else:
+                    logging.error("Session expired; re-login (OTP) required to continue")
+                break
+
+            logging.info("Dialing up tunnel...")
+            self.tunnel()
+
+            logging.info("Tunnel dropped; reconnecting (reusing session, no OTP)...")
+            time.sleep(2)
+            first = False
 
     def login(self, username, password, domain, extra_data={}):
         data = {
@@ -180,7 +201,7 @@ class NXSession(object):
         error = resp.headers.get('X-NE-message', error)
         if error:
             logging.error('Server returned error: "%s"' % error)
-            sys.exit(1)
+            return False
 
         srv_options = {}
         routes = []
@@ -209,6 +230,7 @@ class NXSession(object):
 
         self.srv_options = srv_options
         self.routes = routes
+        return True
 
     def tunnel(self):
         """
@@ -227,6 +249,28 @@ class NXSession(object):
 
         pppd = ppp.PPPSession(self.options, auth_key, routecallback=self.setup_routes)
         pppd.run()
+
+    def _start_keepalive(self, interval=120):
+        """
+        SonicWall expires the authenticated web session after a few minutes of
+        inactivity and then tears down the tunnel, regardless of tunnel traffic.
+        The official client keeps the session warm; so do we, by re-touching the
+        session endpoint periodically with the existing auth cookies.
+        """
+        def loop():
+            while True:
+                time.sleep(interval)
+                try:
+                    self.session.get('https://%s/cgi-bin/sslvpnclient' % self.host,
+                                     params={'launchplatform': 'mac', 'neProto': 3,
+                                             'supportipv6': 'no'},
+                                     timeout=15)
+                    logging.debug("session keepalive sent")
+                except Exception as e:
+                    logging.debug("keepalive failed: %s" % e)
+
+        t = threading.Thread(target=loop, daemon=True)
+        t.start()
 
     def setup_routes(self, ifname):
         for route in set(self.routes):

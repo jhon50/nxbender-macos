@@ -21,7 +21,7 @@ class PPPSession(object):
         self.pppargs = [
                 'debug', 'debug',
                 'dump',
-                'logfd', '2',   # we extract the remote IP thru this
+                'logfile', '/tmp/pppd.log',   # full pppd debug persists here
 
                 'lcp-echo-interval', '10',
                 'lcp-echo-failure',  '2',
